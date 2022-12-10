@@ -3,13 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"flag"
+	"time"
+
 	// "fmt"
 	"os"
 
 	"log"
-	"time"
 
 	"github.com/Dmitded/cam-alarm/db"
 	"github.com/go-redis/redis/v8"
@@ -28,6 +30,7 @@ var (
 
 const (
 	pipeFile = "tmp/event"
+	eventsDir = "tmp/events_files/"
 	timedelta int64 = 20000
 )
 
@@ -36,9 +39,9 @@ type RDatabase struct {
 }
 
 type camEvent struct {
-	Serial string `json:"serial"`
-	EventType string `json:"event_type"`
-	Ts int64 `json:"ts"`
+	Serial string `xml:"serial"`
+	EventType string `xml:"eventType"`
+	Ts time.Time `xml:"dateTime"`
 }
 
 type redisCam struct {
@@ -72,14 +75,6 @@ type PayLoad struct {
 func main() {
 	flag.Parse()
 
-	_, t_err := taskScheduler.ScheduleWithCron(func(ctx context.Context) {
-		log.Print("Scheduled Task With Cron")
-	}, "0 0 * * * *")
-
-	if t_err == nil {
-		log.Print("Task has been scheduled successfully.")
-	}
-
 	var err error
 	rdbr, err := db.NewDatabase(*redisAddr)
 	rdb = *rdbr
@@ -87,6 +82,38 @@ func main() {
 		log.Fatalf("Failed to connect to redis: %s", err.Error())
 	}
 	rdbr.Client.Ping(context.Background())
+
+	_, t_err := taskScheduler.ScheduleWithCron(func(ctx context.Context) {
+		log.Print("Scheduled Task With Cron")
+
+		iter := rdb.Client.Scan(ctx, 0, "cam_*", 0).Iterator()
+		events := `{"data": [` + "\n"
+		for iter.Next(ctx) {
+			val, err := rdb.Client.Get(ctx, iter.Val()).Result()
+			if err != nil {
+				log.Fatalf("Redis error %v", err)
+			}
+			events += val + ",\n"
+		}
+		if err := iter.Err(); err != nil {
+			panic(err)
+		}
+
+		if events != `{"data": [` + "\n" {
+			events += "]}"
+			err := writeDayEventFile(events)
+			if err != nil {
+				log.Fatalf("Error writing to file: %v", err)
+				panic(err)
+			}
+		}
+
+		rdb.Client.FlushAll(ctx)
+	}, "0 0 0 * * *")
+
+	if t_err == nil {
+		log.Print("Task has been scheduled successfully.")
+	}
 
 	h := eventHandler
 	if *compress {
@@ -97,6 +124,23 @@ func main() {
 		log.Fatalf("Error in ListenAndServe: %s", err)
 	}
 }
+
+func writeDayEventFile(data string) error {
+	nowDate := time.Now().Format("2006-01-02")
+	f, err := os.OpenFile(eventsDir + nowDate + ".json", os.O_RDWR|os.O_APPEND|os.O_CREATE, 0777)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+		return err
+	}
+	_, err = f.WriteString(data)
+	if err != nil {
+		log.Fatalf("error writing to file: %v", err)
+		return err
+	}
+	f.Close()
+	return nil
+}
+
 
 func scheduleWrite(data string) {
 	f, err := os.OpenFile(pipeFile, os.O_RDWR|os.O_APPEND, 0777)
@@ -115,11 +159,11 @@ func doRedisSend(ctx *fasthttp.RequestCtx, req camEvent) (bool, error) {
 	var toSend bool = false
 	var err error = nil
 
-	val, redisErr := rdb.Client.Get(ctx, req.Serial).Result()
+	val, redisErr := rdb.Client.Get(ctx, "cam_" + req.Serial).Result()
 	if errors.Is(redisErr, redis.Nil) {
 		toSend = true
-		rCam := redisCam{Serial: req.Serial, Ts: req.Ts, Count: 1}
-		rdb.Client.Set(ctx, req.Serial, rCam.String(), 0)
+		rCam := redisCam{Serial: req.Serial, Ts: req.Ts.UnixMilli(), Count: 1}
+		rdb.Client.Set(ctx, "cam_" + req.Serial, rCam.String(), 0)
 		// log.Print("New cam ", rdb.Client.Get(ctx, req.Serial).Val())
 	} else if redisErr != nil {
 		log.Fatalf("Redis error %v", redisErr)
@@ -127,11 +171,11 @@ func doRedisSend(ctx *fasthttp.RequestCtx, req camEvent) (bool, error) {
 	} else {
 		var rCam redisCam
 		err = json.Unmarshal([]byte(val), &rCam)
-		if err == nil && (rCam.Ts + timedelta < req.Ts) {
+		if err == nil && (rCam.Ts + timedelta < req.Ts.UnixMilli()) {
 			toSend = true
-			rCam.Ts = req.Ts
+			rCam.Ts = req.Ts.UnixMilli()
 			rCam.Count += 1
-			rdb.Client.Set(ctx, req.Serial, rCam.String(), 0)
+			rdb.Client.Set(ctx, "cam_" + req.Serial, rCam.String(), 0)
 			// log.Println("Cam ", rdb.Client.Get(ctx, req.Serial).Val())
 		}
 	}
@@ -141,11 +185,10 @@ func doRedisSend(ctx *fasthttp.RequestCtx, req camEvent) (bool, error) {
 
 func eventHandler(ctx *fasthttp.RequestCtx) {
 	var req camEvent
-	if err := json.Unmarshal(ctx.PostBody(), &req); err != nil {
+	if err := xml.Unmarshal(ctx.PostBody(), &req); err != nil {
 		ctx.Error(err.Error(), fasthttp.StatusBadRequest)
 		return
 	}
-	req.Ts = time.Now().UnixMilli()
 
 	toSend, err := doRedisSend(ctx, req)
 	if err != nil {
@@ -153,9 +196,9 @@ func eventHandler(ctx *fasthttp.RequestCtx) {
 	}
 
 	if toSend {
-		log.Println("Sending ", req.Ts)
+		log.Println("Sending ", req.Serial, req.Ts.UnixMilli())
 		go scheduleWrite(req.String() + "\n")
 	} else {
-		log.Println("Not sending ", req.Ts)
+		log.Println("Not sending ", req.Serial, req.Ts.UnixMilli())
 	}
 }
